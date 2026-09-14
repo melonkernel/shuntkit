@@ -187,6 +187,14 @@ A naive `claude -p --model haiku` inherits the parent session's `CLAUDE.md`, ski
 
 See [docs/design.md](docs/design.md) for how each mechanism works and where it stops, and [docs/upstream.md](docs/upstream.md) for how this repo tracks upstream changes.
 
+## Roadmap
+
+- **Codex CLI as a host.** Codex's hook system mirrors Claude Code's (same `PreToolUse` event, same deny JSON), but Codex reads files through the shell rather than a Read tool, so the Bash hook needs to recognise `sed -n`, `nl` and `rg` context reads, and a `codex exec` worker transport is needed for users without the Claude CLI. Tracked in [#1](https://github.com/melonkernel/shuntkit/issues/1).
+- **Shell forms beyond `cat`/`head`/`tail`.** `sed -n 'A,Bp'` ranges charged to the slice budget; heredoc and `xargs` reads recognised.
+- **Codex CLI as a worker.** A `codex` transport for teams whose cheap model lives on the OpenAI side.
+
+Ideas and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Development
 
 ```bash
