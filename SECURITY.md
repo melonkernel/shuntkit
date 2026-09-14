@@ -10,9 +10,19 @@ Anthropic API. This is the whole point of the tool, but it means:
   plan or API account. If a file must not leave your machine, do not pass it
   to shuntkit. The hooks only *suggest* delegation; Claude can still read a
   file with `offset`/`limit`.
-- Nothing is sent by the hooks themselves. They only count lines locally.
-- Usage records in `~/.local/state/shuntkit/usage.jsonl` contain file paths
-  and token counts, never file contents.
+- A **secret guard** refuses files whose name, parent directory or content
+  looks like a credential (`.env*`, `*.pem`, `id_rsa*`, `credentials*`,
+  `.ssh/`, PEM private key blocks, and more; see `src/shuntkit/secrets.py`).
+  It is a guard rail against accidents, not a scanner. It will not notice an
+  API key pasted into `settings.py`. `SHUNTKIT_SECRET_GUARD=off` disables it.
+- Nothing is sent by the hooks themselves. They only count lines locally and
+  keep a small per-session tally of slice reads.
+- State under `~/.local/state/shuntkit/` (`usage.jsonl`, `slices/`,
+  `sanctions.json`) contains file paths, line counts and token counts, never
+  file contents.
+- The worker runs with no tools, in an empty scratch directory, with the
+  parent's settings, `CLAUDE.md` and MCP servers disabled. It cannot act on
+  your machine; it can only answer.
 
 ## Reporting a vulnerability
 

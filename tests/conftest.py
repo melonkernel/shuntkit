@@ -14,8 +14,29 @@ def make_file(directory: Path, name: str, lines: int) -> Path:
 
 
 @pytest.fixture
-def config() -> Config:
-    return Config()
+def state_dir(tmp_path: Path) -> Path:
+    return tmp_path / "state"
+
+
+@pytest.fixture
+def config(state_dir: Path) -> Config:
+    """Default config with hook state redirected away from the real home dir."""
+    return Config(state_dir=state_dir)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_env(monkeypatch, state_dir: Path):
+    """Config.from_env() in tests must never touch ~/.local/state."""
+    monkeypatch.setenv("SHUNTKIT_STATE_DIR", str(state_dir))
+    for var in (
+        "SHUNTKIT_MIN_LINES",
+        "SHUNT_MIN_LINES",
+        "SHUNTKIT_DISABLED",
+        "SHUNTKIT_DELEGATE",
+        "SHUNTKIT_SLICE_BUDGET_LINES",
+        "CLAUDE_PLUGIN_ROOT",
+    ):
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.fixture

@@ -9,7 +9,7 @@ import pytest
 
 from shuntkit.cli import main
 from shuntkit.install import install, uninstall
-from shuntkit.skills import PLUGIN_COMMAND, SKILLS
+from shuntkit.skills import AGENTS, PLUGIN_COMMAND, SKILLS
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -52,6 +52,16 @@ def test_hook_hint_uses_plugin_root_when_set(files):
     assert 'PYTHONPATH="/plugins/shuntkit/src" python3 -m shuntkit read' in reason
 
 
+def test_hook_subagent_mode_hint(files):
+    proc = run_hook(
+        "read",
+        {"tool_input": {"file_path": str(files["large"])}},
+        env={"SHUNTKIT_DELEGATE": "subagent", "CLAUDE_PLUGIN_ROOT": "/plugins/shuntkit"},
+    )
+    reason = json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+    assert 'subagent_type "shuntkit:bulk-reader"' in reason
+
+
 def test_hook_bash_blocks(files):
     proc = run_hook("bash", {"tool_input": {"command": f"cat {files['large']}"}})
     assert json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
@@ -87,17 +97,20 @@ def test_install_and_uninstall_roundtrip(tmp_path: Path):
         json.dumps({"theme": "dark", "hooks": {"PreToolUse": [{"matcher": "Edit", "hooks": []}]}})
     )
 
-    written = install(claude_dir)
+    written = install(claude_dir, command="/opt/bin/shuntkit")
     data = json.loads(settings.read_text())
     assert data["theme"] == "dark"
     matchers = [e["matcher"] for e in data["hooks"]["PreToolUse"]]
     assert matchers == ["Edit", "Read", "Bash"]
+    assert data["hooks"]["PreToolUse"][1]["hooks"][0]["command"] == "/opt/bin/shuntkit hook read"
     assert (claude_dir / "skills" / "bulk-reader" / "SKILL.md").is_file()
     assert (claude_dir / "skills" / "code-writer" / "SKILL.md").is_file()
-    assert len(written) == 3
+    assert (claude_dir / "agents" / "bulk-reader.md").is_file()
+    assert "/opt/bin/shuntkit read" in (claude_dir / "skills" / "bulk-reader" / "SKILL.md").read_text()
+    assert len(written) == 4
 
     # Idempotent: a second install does not duplicate entries.
-    install(claude_dir)
+    install(claude_dir, command="/opt/bin/shuntkit")
     assert [e["matcher"] for e in json.loads(settings.read_text())["hooks"]["PreToolUse"]] == [
         "Edit",
         "Read",
@@ -108,12 +121,22 @@ def test_install_and_uninstall_roundtrip(tmp_path: Path):
     data = json.loads(settings.read_text())
     assert [e["matcher"] for e in data["hooks"]["PreToolUse"]] == ["Edit"]
     assert not (claude_dir / "skills" / "bulk-reader").exists()
-    assert len(removed) == 3
+    assert not (claude_dir / "agents" / "bulk-reader.md").exists()
+    assert len(removed) == 4
+
+
+def test_install_quotes_paths_with_spaces(tmp_path: Path):
+    claude_dir = tmp_path / ".claude"
+    install(claude_dir, command="/Users/me/my tools/shuntkit")
+    data = json.loads((claude_dir / "settings.json").read_text())
+    assert data["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == '"/Users/me/my tools/shuntkit" hook read'
+    uninstall(claude_dir)
+    assert json.loads((claude_dir / "settings.json").read_text()) == {}
 
 
 def test_install_into_empty_dir(tmp_path: Path):
     claude_dir = tmp_path / ".claude"
-    install(claude_dir)
+    install(claude_dir, command="shuntkit")
     data = json.loads((claude_dir / "settings.json").read_text())
     assert [e["matcher"] for e in data["hooks"]["PreToolUse"]] == ["Read", "Bash"]
     uninstall(claude_dir)
@@ -127,6 +150,19 @@ def test_repo_skills_are_rendered_from_templates():
         assert on_disk == render(PLUGIN_COMMAND), (
             f"skills/{name}/SKILL.md is stale; run scripts/render-skills.py"
         )
+
+
+def test_repo_agents_are_rendered_from_templates():
+    for name, render in AGENTS.items():
+        on_disk = (REPO / "agents" / f"{name}.md").read_text(encoding="utf-8")
+        assert on_disk == render(), f"agents/{name}.md is stale; run scripts/render-skills.py"
+
+
+def test_agent_frontmatter_is_haiku_and_read_only():
+    text = (REPO / "agents" / "bulk-reader.md").read_text()
+    assert "\nmodel: haiku\n" in text
+    assert "\ntools: Read, Glob, Grep\n" in text
+    assert "disallowedTools: Agent" in text
 
 
 def test_plugin_hooks_json_points_at_module():
@@ -146,3 +182,6 @@ def test_plugin_manifest_matches_version():
     assert plugin["version"] == __version__
     assert marketplace["plugins"][0]["version"] == __version__
     assert plugin["name"] == "shuntkit"
+    # agents/ at the plugin root is auto-discovered; an explicit key fails validation.
+    assert "agents" not in plugin
+    assert (REPO / "agents" / "bulk-reader.md").is_file()

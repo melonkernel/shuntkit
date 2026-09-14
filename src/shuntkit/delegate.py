@@ -1,14 +1,18 @@
 """The two delegation jobs: bulk-read and code-write.
 
 Prompt shapes follow upstream shunt: files wrapped in ``<file path=...>`` tags
-followed by the question, or a spec followed by a reference file.
+followed by the question, or a spec followed by a reference file. On top of
+that, this module runs the secret guard before anything leaves the machine,
+attaches verified line numbers to the worker's quotes, and records a
+sanction for delegated files so the slice budget relaxes for them.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from shuntkit import budget, citations, secrets
 from shuntkit.config import READER_SYSTEM_PROMPT, WRITER_SYSTEM_PROMPT, Config
 from shuntkit.transports import Answer, Transport, TransportError
 
@@ -18,6 +22,8 @@ class DelegationResult:
     answer: Answer
     corpus_bytes: int
     files: list[Path]
+    citations_added: int = 0
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def approx_corpus_tokens(self) -> int:
@@ -32,24 +38,46 @@ def _read_text(path: Path) -> str:
         raise TransportError(f"Cannot read {path}: {exc}") from exc
 
 
-def _check_files(paths: list[Path]) -> None:
+def _check_files(paths: list[Path], config: Config) -> None:
     missing = [str(p) for p in paths if not p.is_file()]
     if missing:
         # A typo'd path would otherwise be sent as an empty block and produce a
         # confident answer about nothing. Fail loudly instead.
         raise TransportError("File not found or unreadable: " + ", ".join(missing))
+    seen = set()
+    dupes = [str(p) for p in paths if p.resolve() in seen or seen.add(p.resolve())]  # type: ignore[func-returns-value]
+    if dupes:
+        raise TransportError("Duplicate paths: " + ", ".join(dupes))
+    if config.secret_guard:
+        reasons = secrets.find_secrets(paths)
+        if reasons:
+            raise TransportError(
+                "Refusing to send likely secrets to the worker model:\n  "
+                + "\n  ".join(reasons)
+                + "\nRead these files directly if you must, or set SHUNTKIT_SECRET_GUARD=off."
+            )
+
+
+def _file_blocks(paths: list[Path]) -> str:
+    return "\n".join(f'<file path="{path}">\n{_read_text(path)}\n</file>\n' for path in paths)
 
 
 def build_read_message(paths: list[Path], question: str) -> str:
-    parts = []
-    for path in paths:
-        parts.append(f'<file path="{path}">\n{_read_text(path)}\n</file>\n')
-    parts.append(f"Question: {question}\n")
-    return "\n".join(parts)
+    return _file_blocks(paths) + f"\nQuestion: {question}\n"
 
 
-def build_write_message(spec: str, reference: Path) -> str:
-    return f"Spec: {spec}\n\nReference ({reference.name}):\n{_read_text(reference)}\n"
+def build_write_message(spec: str, reference: Path, context: list[Path] | None = None) -> str:
+    parts = [f"Spec: {spec}\n"]
+    if context:
+        parts.append(
+            "Source files the output must be correct against (read these for actual "
+            "names, signatures and values):\n" + _file_blocks(context)
+        )
+    parts.append(
+        f"Reference file whose conventions the output must match ({reference.name}):\n"
+        + _read_text(reference)
+    )
+    return "\n".join(parts).rstrip("\n") + "\n"
 
 
 def _enforce_payload_cap(message: str, config: Config) -> None:
@@ -62,11 +90,24 @@ def _enforce_payload_cap(message: str, config: Config) -> None:
 
 
 def bulk_read(transport: Transport, config: Config, paths: list[Path], question: str) -> DelegationResult:
-    _check_files(paths)
+    _check_files(paths, config)
     message = build_read_message(paths, question)
     _enforce_payload_cap(message, config)
     answer = transport.invoke(READER_SYSTEM_PROMPT, message)
-    return DelegationResult(answer=answer, corpus_bytes=len(message.encode("utf-8")), files=paths)
+    added = 0
+    if config.citations:
+        before = answer.text
+        answer.text = citations.annotate(answer.text, paths)
+        added = (
+            answer.text.count("`) (") + answer.text.count("` (") - before.count("`) (") - before.count("` (")
+        )
+    budget.sanction(config, paths)
+    return DelegationResult(
+        answer=answer,
+        corpus_bytes=len(message.encode("utf-8")),
+        files=paths,
+        citations_added=max(added, 0),
+    )
 
 
 def strip_fences(text: str) -> str:
@@ -84,10 +125,29 @@ def strip_fences(text: str) -> str:
     return text if text.endswith("\n") else text + "\n"
 
 
-def code_write(transport: Transport, config: Config, spec: str, reference: Path) -> DelegationResult:
-    _check_files([reference])
-    message = build_write_message(spec, reference)
+def code_write(
+    transport: Transport,
+    config: Config,
+    spec: str,
+    reference: Path,
+    context: list[Path] | None = None,
+) -> DelegationResult:
+    context = context or []
+    _check_files([reference, *context], config)
+    message = build_write_message(spec, reference, context)
     _enforce_payload_cap(message, config)
     answer = transport.invoke(WRITER_SYSTEM_PROMPT, message)
     answer.text = strip_fences(answer.text)
-    return DelegationResult(answer=answer, corpus_bytes=len(message.encode("utf-8")), files=[reference])
+    warnings = []
+    if not context:
+        warnings.append(
+            "No --context files given: the worker saw only the reference file's style, not the "
+            "code the output is about. Values, names and signatures may be invented. Pass the "
+            "source under test with --context."
+        )
+    return DelegationResult(
+        answer=answer,
+        corpus_bytes=len(message.encode("utf-8")),
+        files=[reference, *context],
+        warnings=warnings,
+    )

@@ -18,11 +18,21 @@ DEFAULT_TIMEOUT_SECONDS = 180
 # 150k tokens, leaving room for the system prompt and the answer.
 DEFAULT_MAX_PAYLOAD_BYTES = 600_000
 DEFAULT_MAX_OUTPUT_TOKENS = 8192
+# Cumulative targeted-read lines allowed per file per session before the hook
+# insists on one delegation.
+DEFAULT_SLICE_BUDGET_FACTOR = 2
+# After a file has been delegated, targeted reads of it are unrestricted for
+# this long.
+DEFAULT_SANCTION_TTL_SECONDS = 4 * 3600
+DEFAULT_DELEGATE = "cli"
 
 READER_SYSTEM_PROMPT = (
     "You are a precise code analyst. Read the provided files and answer the "
-    "question concisely. Output structured bullets only. Quote identifiers "
-    "exactly as they appear. If the files do not contain the answer, say so."
+    "question concisely. Output structured bullets only. When you refer to "
+    "specific code, quote a distinctive fragment of it verbatim in backticks "
+    "(a few words, exactly as written) so the caller can locate it; the caller "
+    "attaches line numbers to verified quotes. Quote identifiers exactly as "
+    "they appear. If the files do not contain the answer, say so."
 )
 
 WRITER_SYSTEM_PROMPT = (
@@ -44,6 +54,13 @@ def _int_env(name: str, default: int, *fallback_names: str) -> int:
     return default
 
 
+def _flag_env(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Config:
     min_lines: int = DEFAULT_MIN_LINES
@@ -55,6 +72,14 @@ class Config:
     claude_bin: str = "claude"
     state_dir: Path = Path.home() / ".local" / "state" / "shuntkit"
     disabled: bool = False
+    # 0 disables the slice budget.
+    slice_budget_lines: int = DEFAULT_MIN_LINES * DEFAULT_SLICE_BUDGET_FACTOR
+    sanction_ttl_seconds: int = DEFAULT_SANCTION_TTL_SECONDS
+    # "cli": hook messages point at the shuntkit command. "subagent": they point
+    # at the bulk-reader subagent (Agent tool) instead.
+    delegate: str = DEFAULT_DELEGATE
+    secret_guard: bool = True
+    citations: bool = True
 
     @classmethod
     def from_env(cls) -> Config:
@@ -66,8 +91,9 @@ class Config:
             state = Path(xdg) / "shuntkit"
         else:
             state = Path.home() / ".local" / "state" / "shuntkit"
+        min_lines = _int_env("SHUNTKIT_MIN_LINES", DEFAULT_MIN_LINES, "SHUNT_MIN_LINES")
         return cls(
-            min_lines=_int_env("SHUNTKIT_MIN_LINES", DEFAULT_MIN_LINES, "SHUNT_MIN_LINES"),
+            min_lines=min_lines,
             transport=os.environ.get("SHUNTKIT_TRANSPORT", DEFAULT_TRANSPORT).strip().lower(),
             model=os.environ.get("SHUNTKIT_MODEL", DEFAULT_MODEL).strip(),
             timeout_seconds=_int_env("SHUNTKIT_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS),
@@ -75,5 +101,13 @@ class Config:
             max_output_tokens=_int_env("SHUNTKIT_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS),
             claude_bin=os.environ.get("SHUNTKIT_CLAUDE_BIN", "claude").strip() or "claude",
             state_dir=state,
-            disabled=os.environ.get("SHUNTKIT_DISABLED", "").strip().lower() in {"1", "true", "yes"},
+            disabled=_flag_env("SHUNTKIT_DISABLED", default=False),
+            slice_budget_lines=_int_env(
+                "SHUNTKIT_SLICE_BUDGET_LINES", min_lines * DEFAULT_SLICE_BUDGET_FACTOR
+            ),
+            sanction_ttl_seconds=_int_env("SHUNTKIT_SANCTION_TTL_SECONDS", DEFAULT_SANCTION_TTL_SECONDS),
+            delegate=os.environ.get("SHUNTKIT_DELEGATE", DEFAULT_DELEGATE).strip().lower()
+            or DEFAULT_DELEGATE,
+            secret_guard=_flag_env("SHUNTKIT_SECRET_GUARD", default=True),
+            citations=_flag_env("SHUNTKIT_CITATIONS", default=True),
         )

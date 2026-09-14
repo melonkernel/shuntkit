@@ -1,15 +1,22 @@
 """PreToolUse hook decisions.
 
-Two pure functions decide whether a Read or Bash tool call should be blocked
-and redirected to the bulk-reader skill. They take the parsed hook payload and
-a :class:`Config` and return a :class:`Decision`. No I/O beyond stat/reading
-the file to count lines, so they are cheap and easy to test.
+Two pure-ish functions decide whether a Read or Bash tool call should be
+blocked and redirected to delegation. They take the parsed hook payload and a
+:class:`Config` and return a :class:`Decision`. I/O is limited to counting
+lines in the target file and to the small slice-budget state files.
 
-Semantics follow the upstream shunt hooks, with two deliberate differences:
+Semantics follow the upstream shunt hooks, with these deliberate differences:
 
 * ``head``/``tail`` with an explicit line count are treated as targeted reads
   and allowed (upstream blocked ``head -100 big.txt``).
 * ``cat a b c`` sums the line counts of all files (upstream checked the first).
+* A targeted read must itself be at or under the threshold. ``offset`` with
+  no ``limit`` returns up to 2000 lines and is treated as a whole-file read
+  (upstream allowed it and documented it as a known bypass).
+* Targeted reads are charged against a per-session slice budget so a blocked
+  file cannot be reassembled from many small reads.
+* Calls made by the ``bulk-reader`` subagent are exempt (and sanction the
+  file), so the subagent delegation mode works without a network round trip.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from shuntkit import budget
 from shuntkit.config import Config
 
 # Commands that dump a whole file into the transcript.
@@ -31,6 +39,14 @@ SLICE_COMMANDS = frozenset({"head", "tail"})
 # Files the Read tool renders specially (images, PDFs, notebooks). A line count
 # is meaningless for these, so let them through.
 NON_TEXT_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".pdf", ".ipynb"})
+
+# Subagent names whose tool calls bypass the hooks. The plugin form is
+# ``shuntkit:bulk-reader``; ``shuntkit install`` writes a user-level agent
+# named ``bulk-reader``.
+EXEMPT_AGENT_TYPES = frozenset({"bulk-reader", "shuntkit:bulk-reader"})
+
+# The Read tool reads at most this many lines when no limit is given.
+READ_DEFAULT_LIMIT = 2000
 
 
 @dataclass(frozen=True)
@@ -69,38 +85,103 @@ def resolve_path(raw: str, cwd: str | None) -> Path | None:
     return path
 
 
-def block_reason(lines: int, min_lines: int, *, via: str, command_hint: str) -> str:
+def delegation_hint(config: Config) -> str:
+    """Tell Claude exactly how to delegate, for use inside block messages."""
+    root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if config.delegate == "subagent":
+        agent = "shuntkit:bulk-reader" if root else "bulk-reader"
+        return (
+            f'use the Agent tool with subagent_type "{agent}" and ask it your question about the '
+            f"file(s); it reads them in its own context and returns only the answer"
+        )
+    if root:
+        cmd = f'PYTHONPATH="{root}/src" python3 -m shuntkit read --question "<q>" --paths <files>'
+    else:
+        cmd = 'shuntkit read --question "<q>" --paths <files>'
+    return f"use the /bulk-reader skill: {cmd}"
+
+
+def block_reason(lines: int, config: Config, *, via: str) -> str:
     return (
-        f"File is {lines} lines (threshold: {min_lines}). shuntkit blocked this {via} "
-        f"so the whole file does not enter your context. Use the /bulk-reader skill "
-        f"instead: {command_hint}. If you need exact content for editing, re-read "
-        f"with offset/limit for just the section you need."
+        f"File is {lines} lines (threshold: {config.min_lines}). shuntkit blocked this {via} "
+        f"so the whole file does not enter your context. Instead, {delegation_hint(config)}. "
+        f"If you need exact content for editing, re-read with offset/limit for just the section you need."
     )
 
 
-def decide_read(payload: Mapping[str, Any], config: Config, command_hint: str) -> Decision:
+def budget_reason(state: budget.SliceState, path: Path, config: Config) -> str:
+    return (
+        f"You have read {state.total} lines of {path.name} in slices this session "
+        f"(budget: {state.budget}). shuntkit blocked this slice: reassembling a large file piece by "
+        f"piece costs the same as reading it whole. Instead, {delegation_hint(config)}. After the "
+        f"file has been delegated once, targeted reads of it are unrestricted for "
+        f"{config.sanction_ttl_seconds // 3600} hours."
+    )
+
+
+def _is_exempt_agent(payload: Mapping[str, Any]) -> bool:
+    return str(payload.get("agent_type") or "") in EXEMPT_AGENT_TYPES
+
+
+def _charge(payload: Mapping[str, Any], config: Config, path: Path, lines: int) -> Decision:
+    state = budget.charge_slice(config, payload.get("session_id"), path, lines)
+    if state.exceeded:
+        return Decision(allow=False, lines=lines, reason=budget_reason(state, path, config))
+    return Decision(allow=True, lines=lines)
+
+
+def decide_read(payload: Mapping[str, Any], config: Config) -> Decision:
     """Decide a Read tool call."""
     if config.disabled:
         return ALLOW
     tool_input = payload.get("tool_input") or {}
     file_path = tool_input.get("file_path") or ""
-    # Targeted reads: Claude already knows what it needs. Upstream treats a
-    # present-but-zero offset/limit as targeted too; we keep that behaviour.
-    if tool_input.get("offset") is not None or tool_input.get("limit") is not None:
-        return ALLOW
     path = resolve_path(str(file_path), payload.get("cwd"))
-    if path is None or not path.is_file():
+    if path is None or not path.is_file() or path.suffix.lower() in NON_TEXT_SUFFIXES:
         return ALLOW
-    if path.suffix.lower() in NON_TEXT_SUFFIXES:
+
+    offset = tool_input.get("offset")
+    limit = tool_input.get("limit")
+    targeted = offset is not None or limit is not None
+
+    if _is_exempt_agent(payload):
+        # The bulk-reader subagent is doing the delegated read. Let it through
+        # and treat the file as delegated for the parent's slice budget.
+        if not targeted:
+            budget.sanction(config, [path])
         return ALLOW
+
     lines = count_lines(path)
+    if not targeted:
+        if lines <= config.min_lines:
+            return Decision(allow=True, lines=lines)
+        return Decision(allow=False, lines=lines, reason=block_reason(lines, config, via="Read"))
+
+    # Targeted read: Claude already knows what it needs. Small files are
+    # never restricted. For large files, work out how many lines the slice
+    # would actually return: ``offset`` without ``limit`` reads up to 2000
+    # lines, which is a whole-file read in disguise (upstream's evals call
+    # this a "known bypass"; we close it). A genuine slice is charged to the
+    # session budget so the file cannot be reassembled piecemeal.
     if lines <= config.min_lines:
         return Decision(allow=True, lines=lines)
-    return Decision(
-        allow=False,
-        lines=lines,
-        reason=block_reason(lines, config.min_lines, via="Read", command_hint=command_hint),
-    )
+    start = _as_int(offset, 0)
+    wanted = _as_int(limit, READ_DEFAULT_LIMIT)
+    slice_lines = max(0, min(wanted, lines - max(start - 1, 0)))
+    if slice_lines > config.min_lines:
+        return Decision(
+            allow=False,
+            lines=slice_lines,
+            reason=block_reason(slice_lines, config, via="Read (offset/limit)"),
+        )
+    return _charge(payload, config, path, slice_lines)
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
 
 
 def _split_pipeline_free(command: str) -> list[str] | None:
@@ -126,10 +207,9 @@ def _strip_env_and_wrappers(tokens: list[str]) -> list[str]:
     return tokens[i:]
 
 
-def _slice_is_bounded(cmd: str, args: list[str], min_lines: int) -> bool:
-    """True when ``head``/``tail`` would print at most ``min_lines`` lines."""
-    # Default output is 10 lines.
-    count: int | None = 10
+def _slice_count(args: list[str]) -> int | None:
+    """Lines ``head``/``tail`` would print; ``None`` when unbounded."""
+    count: int | None = 10  # default for both commands
     i = 0
     while i < len(args):
         arg = args[i]
@@ -143,14 +223,13 @@ def _slice_is_bounded(cmd: str, args: list[str], min_lines: int) -> bool:
             count = _parse_count(arg[2:])
         elif arg.startswith("-") and arg[1:].isdigit():
             count = int(arg[1:])
-        elif arg in {"-c", "--bytes"} or arg.startswith("--bytes=") or arg.startswith("-c"):
-            # Byte-bounded output; treat as targeted.
-            return True
+        elif arg in {"-c", "--bytes"} or arg.startswith(("--bytes=", "-c")):
+            # Byte-bounded output. Roughly 40 bytes per line of code.
+            raw = args[i + 1] if arg in {"-c", "--bytes"} and i + 1 < len(args) else arg.split("=", 1)[-1]
+            n = _parse_count(raw.lstrip("-c"))
+            return None if n is None else max(1, n // 40)
         i += 1
-    if count is None:
-        # Something like ``tail -n +5`` prints to end of file: unbounded.
-        return False
-    return count <= min_lines
+    return count
 
 
 def _parse_count(raw: str) -> int | None:
@@ -180,9 +259,9 @@ def _file_args(cmd: str, args: list[str]) -> list[str]:
     return files
 
 
-def decide_bash(payload: Mapping[str, Any], config: Config, command_hint: str) -> Decision:
+def decide_bash(payload: Mapping[str, Any], config: Config) -> Decision:
     """Decide a Bash tool call that might dump a large file."""
-    if config.disabled:
+    if config.disabled or _is_exempt_agent(payload):
         return ALLOW
     tool_input = payload.get("tool_input") or {}
     command = (tool_input.get("command") or "").strip()
@@ -201,28 +280,35 @@ def decide_bash(payload: Mapping[str, Any], config: Config, command_hint: str) -
         return ALLOW
     cmd = os.path.basename(tokens[0])
     args = tokens[1:]
-    if cmd in SLICE_COMMANDS:
-        if _slice_is_bounded(cmd, args, config.min_lines):
-            return ALLOW
-    elif cmd not in FULL_READ_COMMANDS:
+    if cmd not in SLICE_COMMANDS and cmd not in FULL_READ_COMMANDS:
         return ALLOW
 
     cwd = payload.get("cwd")
-    total = 0
+    files: list[tuple[Path, int]] = []
     for raw in _file_args(cmd, args):
         path = resolve_path(raw, cwd)
-        if path is None or not path.is_file():
+        if path is None or not path.is_file() or path.suffix.lower() in NON_TEXT_SUFFIXES:
             continue
-        if path.suffix.lower() in NON_TEXT_SUFFIXES:
-            continue
-        total += count_lines(path)
-    if total == 0 or total <= config.min_lines:
+        files.append((path, count_lines(path)))
+    if not files:
+        return ALLOW
+
+    if cmd in SLICE_COMMANDS:
+        count = _slice_count(args)
+        if count is not None and count <= config.min_lines:
+            # Bounded slice: allow, but charge it against the budget for any
+            # file that is itself over the threshold.
+            for path, lines in files:
+                if lines > config.min_lines:
+                    decision = _charge(payload, config, path, min(count, lines))
+                    if decision.blocked:
+                        return decision
+            return Decision(allow=True, lines=count)
+
+    total = sum(lines for _, lines in files)
+    if total <= config.min_lines:
         return Decision(allow=True, lines=total)
-    return Decision(
-        allow=False,
-        lines=total,
-        reason=block_reason(total, config.min_lines, via=f"`{cmd}`", command_hint=command_hint),
-    )
+    return Decision(allow=False, lines=total, reason=block_reason(total, config, via=f"`{cmd}`"))
 
 
 def to_hook_output(decision: Decision) -> dict[str, Any] | None:

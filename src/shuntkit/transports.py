@@ -16,8 +16,10 @@ only the answer text comes back.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -112,16 +114,27 @@ class ClaudeCLITransport:
             )
         return problems
 
+    @staticmethod
+    def _env() -> dict[str, str]:
+        # Drop the markers that tell a CLI it is running inside Claude Code, so
+        # the worker behaves like a fresh headless session.
+        return {k: v for k, v in os.environ.items() if k not in {"CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"}}
+
     def invoke(self, system_prompt: str, message: str) -> Answer:
         try:
-            proc = subprocess.run(
-                self._argv(system_prompt),
-                input=message,
-                capture_output=True,
-                text=True,
-                timeout=self.config.timeout_seconds,
-                check=False,
-            )
+            # Run in an empty scratch directory so no project CLAUDE.md or
+            # .claude/ settings can be picked up, whatever future defaults are.
+            with tempfile.TemporaryDirectory(prefix="shuntkit-") as scratch:
+                proc = subprocess.run(
+                    self._argv(system_prompt),
+                    input=message,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.config.timeout_seconds,
+                    check=False,
+                    cwd=scratch,
+                    env=self._env(),
+                )
         except FileNotFoundError as exc:
             raise TransportError(
                 f"Claude CLI not found ('{self.config.claude_bin}'). Set SHUNTKIT_CLAUDE_BIN."

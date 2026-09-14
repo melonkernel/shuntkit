@@ -23,14 +23,6 @@ from shuntkit.config import Config
 from shuntkit.transports import TransportError
 
 
-def _command_hint() -> str:
-    """How the skills should invoke us, for use inside hook block messages."""
-    root = os.environ.get("CLAUDE_PLUGIN_ROOT")
-    if root:
-        return f'PYTHONPATH="{root}/src" python3 -m shuntkit read --question "<q>" --paths <files>'
-    return 'shuntkit read --question "<q>" --paths <files>'
-
-
 def cmd_hook(args: argparse.Namespace) -> int:
     from shuntkit.hooks import decide_bash, decide_read, to_hook_output
 
@@ -42,10 +34,10 @@ def cmd_hook(args: argparse.Namespace) -> int:
     if not isinstance(payload, dict):
         return 0
     config = Config.from_env()
-    hint = _command_hint()
-    decision = (
-        decide_read(payload, config, hint) if args.kind == "read" else decide_bash(payload, config, hint)
-    )
+    try:
+        decision = decide_read(payload, config) if args.kind == "read" else decide_bash(payload, config)
+    except Exception:  # noqa: BLE001 - a hook must never break the session
+        return 0
     output = to_hook_output(decision)
     if output is not None:
         print(json.dumps(output))
@@ -78,7 +70,10 @@ def cmd_write(args: argparse.Namespace) -> int:
     if args.model:
         config = Config(**{**config.__dict__, "model": args.model})
     transport = get_transport(config)
-    result = code_write(transport, config, args.spec, Path(args.reference).expanduser())
+    context = [Path(p).expanduser() for p in (args.context or [])]
+    result = code_write(transport, config, args.spec, Path(args.reference).expanduser(), context)
+    for warning in result.warnings:
+        print(f"[shuntkit warning] {warning}", file=sys.stderr)
     if args.target:
         target = Path(args.target).expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -96,9 +91,10 @@ def _report(result, config: Config) -> None:
     u = result.answer.usage
     cost = f" | worker cost ${u.cost_usd:.4f}" if u.cost_usd is not None else ""
     worker_in = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
+    cites = f" | {result.citations_added} verified citations" if result.citations_added else ""
     print(
         f"[shuntkit: ~{result.approx_corpus_tokens:,} tokens kept out of context | "
-        f"worker {u.model or config.model} used {worker_in:,} in / {u.output_tokens:,} out{cost}]",
+        f"worker {u.model or config.model} used {worker_in:,} in / {u.output_tokens:,} out{cost}{cites}]",
         file=sys.stderr,
     )
 
@@ -106,7 +102,7 @@ def _report(result, config: Config) -> None:
 def cmd_install(args: argparse.Namespace) -> int:
     from shuntkit.install import install
 
-    written = install(Path(args.claude_dir).expanduser())
+    written = install(Path(args.claude_dir).expanduser(), args.command)
     print("shuntkit installed. Updated:")
     for w in written:
         print(f"  {w}")
@@ -138,7 +134,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"  transport:  {config.transport}")
     print(f"  model:      {config.model}")
     print(f"  min_lines:  {config.min_lines}")
+    print(f"  budget:     {config.slice_budget_lines} lines/file/session (0 = off)")
+    print(f"  delegate:   {config.delegate}")
+    secrets_state = "on" if config.secret_guard else "off"
+    citations_state = "on" if config.citations else "off"
+    print(f"  guards:     secrets={secrets_state} citations={citations_state}")
+    print(f"  state_dir:  {config.state_dir}")
     print(f"  disabled:   {config.disabled}")
+    if config.delegate not in {"cli", "subagent"}:
+        problems.append(f"SHUNTKIT_DELEGATE must be 'cli' or 'subagent', not '{config.delegate}'.")
     try:
         transport = get_transport(config)
         problems.extend(transport.check())
@@ -214,18 +218,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("write", help="Delegate boilerplate generation to the worker model")
     p.add_argument("--spec", required=True)
-    p.add_argument("--reference", required=True, metavar="FILE")
+    p.add_argument("--reference", required=True, metavar="FILE", help="File whose conventions to match")
+    p.add_argument(
+        "--context", nargs="+", metavar="FILE", help="Source files the output must be correct against"
+    )
     p.add_argument("--target", metavar="FILE", help="Write output here instead of stdout")
     p.add_argument("--model", help="Override SHUNTKIT_MODEL for this call")
     p.set_defaults(func=cmd_write)
 
-    for name, func, help_text in (
-        ("install", cmd_install, "Register hooks and skills in ~/.claude"),
-        ("uninstall", cmd_uninstall, "Remove what 'install' added"),
-    ):
-        p = sub.add_parser(name, help=help_text)
-        p.add_argument("--claude-dir", default="~/.claude")
-        p.set_defaults(func=func)
+    p = sub.add_parser("install", help="Register hooks, skills and the bulk-reader agent in ~/.claude")
+    p.add_argument("--claude-dir", default="~/.claude")
+    p.add_argument("--command", help="Override the shuntkit executable path written into hooks")
+    p.set_defaults(func=cmd_install)
+
+    p = sub.add_parser("uninstall", help="Remove what 'install' added")
+    p.add_argument("--claude-dir", default="~/.claude")
+    p.set_defaults(func=cmd_uninstall)
 
     p = sub.add_parser("doctor", help="Check the environment")
     p.add_argument("--claude-dir", default="~/.claude")

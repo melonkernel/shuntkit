@@ -11,5 +11,10 @@ Each call is independent. To ask a follow-up, ask again with the same `--paths`.
 The files go to the worker model, never into your context, so re-sending them
 costs you nothing here.
 
-The worker returns bullets, not line numbers. Verify specific line numbers or
-exact values with a targeted `Read` (offset/limit) before using them in edits.
+The answer is bullets. Backticked quotes that shuntkit could locate exactly
+once in the files carry a verified `(file:line)` suffix; you can rely on those.
+Anything without a suffix is unverified: confirm with a targeted `Read`
+(offset/limit) before editing.
+
+shuntkit refuses files that look like secrets (`.env`, keys, credentials).
+Read those directly if you must.

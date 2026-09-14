@@ -32,8 +32,12 @@ or add the checkout as a local plugin: `claude --plugin-dir .`.
   `tests/test_bash_hook.py` mirror upstream's eval cases. Add a case for every
   new heuristic. If you diverge from upstream on purpose, say so in the test
   docstring and in the README table.
-- **Skill text lives in one place.** Edit `src/shuntkit/skills.py`, run
-  `scripts/render-skills.py`, commit both.
+- **Skill and agent text lives in one place.** Edit `src/shuntkit/skills.py`,
+  run `scripts/render-skills.py`, commit the rendered `skills/` and `agents/`
+  files with it.
+- **Read `docs/design.md` before changing hook semantics.** It states what
+  each rule is for and what it deliberately does not cover. Update it in the
+  same PR.
 - **Keep the transport interface small.** A transport is `invoke(system,
   message) -> Answer` plus `check() -> list[str]`. New transports are welcome
   if they call a Claude model; this project deliberately stays Claude-only.
