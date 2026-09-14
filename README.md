@@ -189,7 +189,7 @@ See [docs/design.md](docs/design.md) for how each mechanism works and where it s
 
 ## Roadmap
 
-- **Codex CLI as a host.** Codex's hook system mirrors Claude Code's (same `PreToolUse` event, same deny JSON), but Codex reads files through the shell rather than a Read tool, so the Bash hook needs to recognise `sed -n`, `nl` and `rg` context reads, and a `codex exec` worker transport is needed for users without the Claude CLI. Tracked in [#1](https://github.com/melonkernel/shuntkit/issues/1).
+- **Codex CLI as a host.** Codex's hook system mirrors Claude Code's (same `PreToolUse` event, same deny JSON), but Codex reads files through the shell rather than a Read tool, so the Bash hook needs to recognise `sed -n`, `nl` and `rg` context reads, and a `codex exec` worker transport is needed for users without the Claude CLI. Tracked in [#5](https://github.com/melonkernel/shuntkit/issues/5).
 - **Shell forms beyond `cat`/`head`/`tail`.** `sed -n 'A,Bp'` ranges charged to the slice budget; heredoc and `xargs` reads recognised.
 - **Codex CLI as a worker.** A `codex` transport for teams whose cheap model lives on the OpenAI side.
 
