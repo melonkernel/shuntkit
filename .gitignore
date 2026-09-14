@@ -20,5 +20,7 @@ uv.lock
 .vscode/
 *.swp
 
-# Local Claude Code state (project-level)
-.claude/settings.local.json
+# Local Claude Code state (project-level). This repo is itself a Claude Code
+# plugin, so a committed project install would double the hooks and break for
+# contributors without shuntkit on PATH. Dogfood with `shuntkit install` locally.
+.claude/

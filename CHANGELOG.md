@@ -6,6 +6,26 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Codex CLI as a host: `shuntkit install --host codex` writes the Bash hook
+  into `.codex/hooks.json` (or `~/.codex/hooks.json` with `--user`). Block
+  messages are worded for Codex (`--host codex` on the hook, or
+  `SHUNTKIT_HOST`). Verified against Codex CLI 0.153.4.
+- The Bash hook now understands the shell reads Codex uses instead of a Read
+  tool: `sed -n 'A,Bp'` ranges are bounded slices charged to the slice
+  budget, `sed -n 'A,$p'` and `sed` without `-n` are whole-file reads, `nl`
+  and `cat -n` are whole-file reads, and a leading `cd dir &&` is followed so
+  the read is judged in that directory.
+
+### Changed
+
+- `shuntkit install` and `shuntkit uninstall` are now per project by default:
+  they target `./.claude` in the current directory and write the portable
+  `shuntkit` command. `--user` restores the previous behaviour (`~/.claude`,
+  absolute executable path). `--claude-dir` still overrides both.
+- `shuntkit doctor` reports hooks registered at project and user scope.
+
 ## [0.1.0] - 2026-09-14
 
 Initial release. A Python port of the `shunt` plugin from

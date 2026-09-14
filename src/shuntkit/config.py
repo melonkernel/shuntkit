@@ -25,6 +25,10 @@ DEFAULT_SLICE_BUDGET_FACTOR = 2
 # this long.
 DEFAULT_SANCTION_TTL_SECONDS = 4 * 3600
 DEFAULT_DELEGATE = "cli"
+# Which coding agent the hooks are talking to. Changes the wording of block
+# messages (Codex has no Read tool, no skills and no Agent tool).
+DEFAULT_HOST = "claude"
+HOSTS = ("claude", "codex")
 
 READER_SYSTEM_PROMPT = (
     "You are a precise code analyst. Read the provided files and answer the "
@@ -78,6 +82,7 @@ class Config:
     # "cli": hook messages point at the shuntkit command. "subagent": they point
     # at the bulk-reader subagent (Agent tool) instead.
     delegate: str = DEFAULT_DELEGATE
+    host: str = DEFAULT_HOST
     secret_guard: bool = True
     citations: bool = True
 
@@ -108,6 +113,7 @@ class Config:
             sanction_ttl_seconds=_int_env("SHUNTKIT_SANCTION_TTL_SECONDS", DEFAULT_SANCTION_TTL_SECONDS),
             delegate=os.environ.get("SHUNTKIT_DELEGATE", DEFAULT_DELEGATE).strip().lower()
             or DEFAULT_DELEGATE,
+            host=os.environ.get("SHUNTKIT_HOST", DEFAULT_HOST).strip().lower() or DEFAULT_HOST,
             secret_guard=_flag_env("SHUNTKIT_SECRET_GUARD", default=True),
             citations=_flag_env("SHUNTKIT_CITATIONS", default=True),
         )

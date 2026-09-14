@@ -135,6 +135,84 @@ def test_subagent_exempt(files, config):
     assert decide_bash(p, config).allow
 
 
+# --- Codex-style shell reads (no Read tool) --------------------------------
+
+
+def test_nl_large_blocks(files, config):
+    assert decide_bash(payload(f"nl -ba {files['large']}"), config).blocked
+
+
+def test_cat_n_large_blocks(files, config):
+    assert decide_bash(payload(f"cat -n {files['large']}"), config).blocked
+
+
+@pytest.mark.parametrize(
+    "script",
+    ["'1,200p'", "1,200p", "'100,+50p'", "'5p'", "'1,100p;300,350p'"],
+)
+def test_sed_bounded_range_allows(files, config, script):
+    d = decide_bash(payload(f"sed -n {script} {files['large']}"), config)
+    assert d.allow
+    assert 0 < d.lines <= config.min_lines
+
+
+def test_sed_bounded_range_is_charged_to_budget(files, config):
+    p = payload(f"sed -n '1,300p' {files['large']}")
+    assert decide_bash(p, config).allow
+    assert decide_bash(p, config).allow
+    third = decide_bash(p, config)  # 900 lines > 700 budget
+    assert third.blocked
+    assert "budget" in third.reason
+
+
+def test_sed_range_over_threshold_blocks(files, config):
+    assert decide_bash(payload(f"sed -n '1,400p' {files['large']}"), config).blocked
+
+
+def test_sed_to_end_of_file_blocks(files, config):
+    assert decide_bash(payload(f"sed -n '10,$p' {files['large']}"), config).blocked
+
+
+def test_sed_without_n_prints_whole_file_and_blocks(files, config):
+    assert decide_bash(payload(f"sed 's/a/b/' {files['large']}"), config).blocked
+
+
+@pytest.mark.parametrize("form", ["-ne '1,50p'", "-e '1,50p' -n", "--quiet --expression='1,50p'"])
+def test_sed_expression_forms(files, config, form):
+    d = decide_bash(payload(f"sed {form} {files['large']}"), config)
+    assert d.allow and d.lines == 50
+
+
+def test_sed_regex_address_is_a_filter_and_allows(files, config):
+    assert decide_bash(payload(f"sed -n '/line 4/p' {files['large']}"), config).allow
+
+
+def test_sed_in_place_allows(files, config):
+    assert decide_bash(payload(f"sed -i 's/a/b/' {files['large']}"), config).allow
+
+
+def test_sed_small_file_allows(files, config):
+    assert decide_bash(payload(f"sed -n '1,$p' {files['small']}"), config).allow
+
+
+def test_rg_context_reads_allow(files, config):
+    assert decide_bash(payload(f"rg -n -C 20 'line 7' {files['large']}"), config).allow
+    assert decide_bash(payload(f"grep -A 5 -B 5 'line 7' {files['large']}"), config).allow
+
+
+def test_cd_then_cat_is_inspected_in_that_directory(files, config):
+    large = files["large"]
+    assert decide_bash(payload(f"cd {large.parent} && cat {large.name}"), config).blocked
+    assert decide_bash(payload(f"cd {large.parent}; sed -n '1,400p' {large.name}"), config).blocked
+    assert decide_bash(payload(f"cd {large.parent} && head -20 {large.name}"), config).allow
+
+
+def test_cd_relative_to_payload_cwd(files, config):
+    large = files["large"]
+    p = payload(f"cd {large.parent.name} && cat {large.name}", cwd=str(large.parent.parent))
+    assert decide_bash(p, config).blocked
+
+
 def test_head_slices_are_charged_to_budget(files, config):
     """Six head -n 200 calls on a 1200-line file = 1200 lines > 700 budget."""
     for _ in range(3):

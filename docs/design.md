@@ -51,18 +51,24 @@ counts in well under a second.
 ```
 command contains | or >                                   -> allow (output goes elsewhere)
 shlex fails (unbalanced quotes)                           -> allow
-first simple command (before && ; ||), after env/sudo:
-    not in {cat less more bat batcat head tail}           -> allow
+leading `cd dir &&` / `cd dir;` segments                  -> followed; later paths resolve in dir
+first remaining simple command, after env/sudo:
+    not in {cat nl less more bat batcat head tail sed}    -> allow
     head/tail with bounded count <= min_lines             -> charge slice budget per large file
     head/tail unbounded (-n +5, -c huge, 10k)             -> treat as full read
+    sed -n 'A,Bp' / 'A,+Np' / 'Np' (sum of ranges)        -> bounded slice, as head/tail
+    sed -n 'A,$p', or sed without -n                      -> treat as full read
+    sed -n '/re/p', sed -i, sed -f                        -> allow (filter, in-place, opaque)
     full read: sum of lines over all file args
         <= min_lines                                      -> allow
         >  min_lines                                      -> DENY (delegate)
 ```
 
-Only the first command in a chain is inspected. `echo x && cat big.txt` gets
-through. This matches upstream and is a deliberate trade against parsing
-every shell construct; the Read tool is what Claude reaches for by default.
+Only the first command after any leading `cd` is inspected. `echo x && cat
+big.txt` gets through. This matches upstream and is a deliberate trade
+against parsing every shell construct. `sed`, `nl` and `cd` are handled
+because they are how Codex, which has no Read tool, reads files; Claude Code
+reaches for Read by default.
 
 ## 3. Slice budget
 
@@ -225,25 +231,77 @@ for people who prefer Claude Code's native mechanism.
 
 ## 9. Install modes
 
-**pip / uv / pipx.** `shuntkit install` writes two PreToolUse entries into
-`~/.claude/settings.json`, the two SKILL.md files into `~/.claude/skills/`,
-and the agent into `~/.claude/agents/`. The hook command uses the absolute
-path of the `shuntkit` executable, because hooks run in a non-login shell
-where `~/.local/bin` is frequently absent from `PATH`. `shuntkit uninstall`
-removes exactly those entries and files.
+**pip / uv / pipx.** `shuntkit install` writes two PreToolUse entries into a
+`settings.json`, the two SKILL.md files into `skills/`, and the agent into
+`agents/` under one Claude settings directory. `shuntkit uninstall` removes
+exactly those entries and files. There are two scopes:
+
+- `--project` (default) targets `./.claude`. Only that repository gets the
+  hooks, and the files are meant to be committed. The hook command is the
+  bare name `shuntkit`, because an absolute path from one developer's machine
+  would break for everyone else. It must therefore be on `PATH` when Claude
+  Code starts; `--command` overrides it.
+- `--user` targets `~/.claude` and applies to every project. The hook command
+  is the absolute path of the executable, because hooks run in a non-login
+  shell where `~/.local/bin` is frequently absent from `PATH`.
+
+Per project is the default because the hooks change how the model reads
+files and spend money on every delegation. Opting a repository in is a
+smaller decision than opting a whole machine in, and it mirrors how other
+project-specific hooks (lint gates, test runners) are set up. The upstream
+plugin is user-wide because plugins can only be.
+
+**Codex.** `shuntkit install --host codex` writes only the Bash hook, into
+`.codex/hooks.json` (project) or `~/.codex/hooks.json` (user), with the
+command `shuntkit hook bash --host codex`. Codex will not run a hook until
+the user has trusted it with `/hooks`, and project hooks load only inside a
+trusted project; the install prints both facts because it cannot do either.
+Codex's plugin manifest validator rejects a `hooks` field, so there is no
+plugin form for Codex.
 
 **Plugin.** The repo root is a Claude Code plugin. `hooks/hooks.json` runs
 `python3 -m shuntkit` with `PYTHONPATH` set to the plugin's `src/`, so
 nothing is pip-installed. The checked-in `skills/` and `agents/` files are
 rendered from `src/shuntkit/skills.py`; a test fails when they drift.
 
-## 10. Known limitations
+## 10. Hosts: Claude Code and Codex
+
+The hooks were written for Claude Code. Codex CLI was verified against
+version 0.153.4 (September 2026) and differs in these ways:
+
+| | Claude Code | Codex |
+|---|---|---|
+| Hook event and deny JSON | `PreToolUse`, `hookSpecificOutput.permissionDecision` | Identical |
+| Shell tool | `Bash`, `tool_input.command` | Identical |
+| File reads | `Read` tool with `offset`/`limit` | Shell only: `sed -n`, `cat -n`, `nl`, `rg -C` |
+| Hook files | `settings.json` | `hooks.json`, or `[hooks]` in `config.toml` |
+| Trust | None | `/hooks` review per hook; project must be trusted |
+| Plugins can ship hooks | Yes | No (manifest validator rejects `hooks`) |
+| Subagent identity in payload | `agent_type` | None; subagents share the parent `session_id` |
+| Skills / Agent tool | Yes | Not used by shuntkit |
+
+Consequences. The Read hook is not installed on Codex. Block messages are
+worded per host (`--host codex` on the hook command, or `SHUNTKIT_HOST`):
+Codex is told to run `shuntkit read ...` as a shell command and to slice
+with `sed -n 'A,Bp'`, and is never pointed at a skill or the Agent tool.
+Subagent mode is Claude-only, because without an identity field the hooks
+cannot exempt a Codex subagent's reads. The CLI worker needs no exemption on
+either host: it is a separate process with hooks disabled.
+
+The deny reason does reach the Codex model. In the verification run it
+reported back "a PreToolUse hook blocked `cat big.txt` because the file has
+500 lines, exceeding the 350-line threshold" and stopped.
+
+## 11. Known limitations
 
 - **Windows is unsupported.** Hook commands assume a POSIX shell and `python3`.
-- **Shell parsing is shallow.** Heredocs, subshells, `xargs cat`, `sed -n
-  '1,900p'`, `awk`, `python -c "print(open(...).read())"` are not recognised.
-  The hooks target what Claude actually does, not what a determined user
-  could do.
+- **Shell parsing is shallow.** Heredocs, subshells, `xargs cat`, `awk`,
+  `grep -n "" big.txt`, `python -c "print(open(...).read())"` are not
+  recognised. The hooks target what the model actually does, not what a
+  determined user could do.
+- **Codex delegation needs a Claude transport.** On Codex the worker is still
+  the Claude CLI or the Anthropic API. A `codex exec` transport is on the
+  roadmap.
 - **Slice budget races.** Parallel tool calls on the same file can each read
   the counter before either writes it. One increment is lost. Acceptable.
 - **`--max-turns 1`** means the worker cannot call tools, by design. It

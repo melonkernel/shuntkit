@@ -22,6 +22,7 @@ Semantics follow the upstream shunt hooks, with these deliberate differences:
 from __future__ import annotations
 
 import os
+import re
 import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -32,9 +33,14 @@ from shuntkit import budget
 from shuntkit.config import Config
 
 # Commands that dump a whole file into the transcript.
-FULL_READ_COMMANDS = frozenset({"cat", "less", "more", "bat", "batcat"})
+FULL_READ_COMMANDS = frozenset({"cat", "less", "more", "bat", "batcat", "nl"})
 # Commands that read a bounded slice unless told otherwise.
 SLICE_COMMANDS = frozenset({"head", "tail"})
+# ``sed -n 'A,Bp'`` is how Codex (which has no Read tool) reads a slice.
+SED_COMMANDS = frozenset({"sed", "gsed"})
+# ``cd dir && <read>``: the read is inspected relative to ``dir``.
+CHDIR_COMMANDS = frozenset({"cd", "pushd"})
+COMMAND_SEPARATORS = ("&&", ";", "||", "&")
 
 # Files the Read tool renders specially (images, PDFs, notebooks). A line count
 # is meaningless for these, so let them through.
@@ -86,8 +92,14 @@ def resolve_path(raw: str, cwd: str | None) -> Path | None:
 
 
 def delegation_hint(config: Config) -> str:
-    """Tell Claude exactly how to delegate, for use inside block messages."""
+    """Tell the model exactly how to delegate, for use inside block messages."""
     root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if config.host == "codex":
+        # No skills, no Agent tool: the shell command is the whole story.
+        return (
+            'run this shell command: shuntkit read --question "<q>" --paths <files> '
+            "(it answers your question from the files without loading them here)"
+        )
     if config.delegate == "subagent":
         agent = "shuntkit:bulk-reader" if root else "bulk-reader"
         return (
@@ -102,10 +114,14 @@ def delegation_hint(config: Config) -> str:
 
 
 def block_reason(lines: int, config: Config, *, via: str) -> str:
+    if config.host == "codex":
+        slice_hint = "read just the section you need with sed -n 'A,Bp' <file>"
+    else:
+        slice_hint = "re-read with offset/limit for just the section you need"
     return (
         f"File is {lines} lines (threshold: {config.min_lines}). shuntkit blocked this {via} "
         f"so the whole file does not enter your context. Instead, {delegation_hint(config)}. "
-        f"If you need exact content for editing, re-read with offset/limit for just the section you need."
+        f"If you need exact content for editing, {slice_hint}."
     )
 
 
@@ -191,7 +207,11 @@ def _split_pipeline_free(command: str) -> list[str] | None:
     if "|" in command or ">" in command:
         return None
     try:
-        tokens = shlex.split(command)
+        # ``punctuation_chars`` makes ``cd dir; cat f`` tokenize with ``;`` on
+        # its own, and keeps ``&&`` / ``||`` as single tokens.
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
     except ValueError:
         return None
     return tokens or None
@@ -242,6 +262,107 @@ def _parse_count(raw: str) -> int | None:
     return int(raw) if raw.isdigit() else None
 
 
+_SED_RANGE = re.compile(r"^(\d+)(?:,(\$|\d+|\+\d+))?p$")
+
+
+def _sed_parse(args: list[str]) -> tuple[str, int, list[str]]:
+    """Classify a ``sed`` call as ``("full" | "slice" | "allow", lines, files)``.
+
+    ``sed -n 'A,Bp' f`` is a slice of B-A+1 lines. ``sed -n 'A,$p' f`` and any
+    ``sed`` without ``-n`` print the whole file. Regex addresses, ``-i`` and
+    ``-f`` are let through: they filter, edit in place, or are opaque.
+    """
+    quiet = False
+    scripts: list[str] = []
+    files: list[str] = []
+    positional_script = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in {"-e", "--expression"} and i + 1 < len(args):
+            scripts.append(args[i + 1])
+            i += 2
+            continue
+        if arg.startswith("--expression="):
+            scripts.append(arg.split("=", 1)[1])
+        elif arg in {"-i", "-f", "--in-place", "--file"} or arg.startswith(("-i", "--in-place=", "--file=")):
+            return ("allow", 0, [])  # edits in place, or script from a file: opaque
+        elif arg in {"--quiet", "--silent"}:
+            quiet = True
+        elif arg.startswith("--"):
+            pass
+        elif arg.startswith("-") and len(arg) > 1:
+            if "n" in arg[1:]:
+                quiet = True
+            if "e" in arg[1:] and i + 1 < len(args):  # ``-ne 'script'``
+                scripts.append(args[i + 1])
+                i += 1
+        elif not scripts and not positional_script:
+            scripts.append(arg)
+            positional_script = True
+        else:
+            files.append(arg)
+        i += 1
+    if not quiet:
+        return ("full", 0, files)
+    total = 0
+    for script in scripts:
+        for raw_part in re.split(r"[;\n]", script):
+            part = raw_part.strip()
+            if not part:
+                continue
+            m = _SED_RANGE.match(part)
+            if not m:
+                return ("allow", 0, files)
+            start, end = int(m.group(1)), m.group(2)
+            if end is None:
+                total += 1
+            elif end == "$":
+                return ("full", 0, files)
+            elif end.startswith("+"):
+                total += int(end[1:]) + 1
+            else:
+                total += max(0, int(end) - start + 1)
+    return ("slice", total, files)
+
+
+def _classify(cmd: str, args: list[str]) -> tuple[str, int, list[str]]:
+    """``("full" | "slice" | "allow", slice_lines, file_args)`` for one simple command."""
+    if cmd in SED_COMMANDS:
+        return _sed_parse(args)
+    if cmd in SLICE_COMMANDS:
+        count = _slice_count(args)
+        if count is None:
+            return ("full", 0, _file_args(cmd, args))
+        return ("slice", count, _file_args(cmd, args))
+    if cmd in FULL_READ_COMMANDS:
+        return ("full", 0, _file_args(cmd, args))
+    return ("allow", 0, [])
+
+
+def _first_read_segment(tokens: list[str], cwd: str | None) -> tuple[list[str], str | None]:
+    """Skip leading ``cd dir &&`` segments, tracking the directory they move to."""
+    segments: list[list[str]] = [[]]
+    for tok in tokens:
+        if tok in COMMAND_SEPARATORS:
+            segments.append([])
+        else:
+            segments[-1].append(tok)
+    for raw_segment in segments:
+        segment = _strip_env_and_wrappers(raw_segment)
+        if not segment:
+            return [], cwd
+        if os.path.basename(segment[0]) in CHDIR_COMMANDS:
+            target = next((a for a in segment[1:] if not a.startswith("-")), None)
+            if target is None:
+                return [], cwd
+            moved = resolve_path(target, cwd)
+            cwd = str(moved) if moved else cwd
+            continue
+        return segment, cwd
+    return [], cwd
+
+
 def _file_args(cmd: str, args: list[str]) -> list[str]:
     files: list[str] = []
     skip_next = False
@@ -270,22 +391,18 @@ def decide_bash(payload: Mapping[str, Any], config: Config) -> Decision:
     tokens = _split_pipeline_free(command)
     if not tokens:
         return ALLOW
-    # Only inspect the first simple command; ``a && b`` chains are rare for
-    # plain reads and upstream ignores them as well.
-    for sep in ("&&", ";", "||"):
-        if sep in tokens:
-            tokens = tokens[: tokens.index(sep)]
-    tokens = _strip_env_and_wrappers(tokens)
+    # Only the first simple command is inspected, after any leading ``cd``.
+    # ``echo x && cat big`` gets through, as it does upstream.
+    tokens, cwd = _first_read_segment(tokens, payload.get("cwd"))
     if not tokens:
         return ALLOW
     cmd = os.path.basename(tokens[0])
-    args = tokens[1:]
-    if cmd not in SLICE_COMMANDS and cmd not in FULL_READ_COMMANDS:
+    kind, count, raw_files = _classify(cmd, tokens[1:])
+    if kind == "allow":
         return ALLOW
 
-    cwd = payload.get("cwd")
     files: list[tuple[Path, int]] = []
-    for raw in _file_args(cmd, args):
+    for raw in raw_files:
         path = resolve_path(raw, cwd)
         if path is None or not path.is_file() or path.suffix.lower() in NON_TEXT_SUFFIXES:
             continue
@@ -293,17 +410,15 @@ def decide_bash(payload: Mapping[str, Any], config: Config) -> Decision:
     if not files:
         return ALLOW
 
-    if cmd in SLICE_COMMANDS:
-        count = _slice_count(args)
-        if count is not None and count <= config.min_lines:
-            # Bounded slice: allow, but charge it against the budget for any
-            # file that is itself over the threshold.
-            for path, lines in files:
-                if lines > config.min_lines:
-                    decision = _charge(payload, config, path, min(count, lines))
-                    if decision.blocked:
-                        return decision
-            return Decision(allow=True, lines=count)
+    if kind == "slice" and count <= config.min_lines:
+        # Bounded slice: allow, but charge it against the budget for any
+        # file that is itself over the threshold.
+        for path, lines in files:
+            if lines > config.min_lines:
+                decision = _charge(payload, config, path, min(count, lines))
+                if decision.blocked:
+                    return decision
+        return Decision(allow=True, lines=count)
 
     total = sum(lines for _, lines in files)
     if total <= config.min_lines:

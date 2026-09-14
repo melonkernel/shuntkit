@@ -13,13 +13,14 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
 from pathlib import Path
 
 from shuntkit import __version__
-from shuntkit.config import Config
+from shuntkit.config import HOSTS, Config
 from shuntkit.transports import TransportError
 
 
@@ -34,6 +35,8 @@ def cmd_hook(args: argparse.Namespace) -> int:
     if not isinstance(payload, dict):
         return 0
     config = Config.from_env()
+    if args.host:
+        config = dataclasses.replace(config, host=args.host)
     try:
         decision = decide_read(payload, config) if args.kind == "read" else decide_bash(payload, config)
     except Exception:  # noqa: BLE001 - a hook must never break the session
@@ -99,32 +102,54 @@ def _report(result, config: Config) -> None:
     )
 
 
-def cmd_install(args: argparse.Namespace) -> int:
-    from shuntkit.install import install
+def _scope_label(args: argparse.Namespace) -> str:
+    where = "custom dir" if args.claude_dir else f"{args.scope} scope"
+    return f"{args.host}, {where}"
 
-    written = install(Path(args.claude_dir).expanduser(), args.command)
-    print("shuntkit installed. Updated:")
+
+def cmd_install(args: argparse.Namespace) -> int:
+    from shuntkit.install import PROJECT_SCOPE, install, resolve_target
+
+    claude_dir, default_command = resolve_target(args.scope, args.claude_dir, args.host)
+    command = args.command or default_command
+    written = install(claude_dir, command, args.host)
+    print(f"shuntkit installed ({_scope_label(args)}). Updated:")
     for w in written:
         print(f"  {w}")
-    print("Restart Claude Code (or start a new session) for the hooks to load.")
+    app = "Claude Code" if args.host == "claude" else "Codex"
+    if args.scope == PROJECT_SCOPE and not args.claude_dir and not args.command:
+        print(
+            f"Hooks call `shuntkit` by name, so it must be on PATH when {app} starts.\n"
+            f"If {app} is launched from an app rather than a terminal, use:\n"
+            f'  shuntkit install --host {args.host} --command "$(command -v shuntkit)"'
+        )
+    if args.host == "codex":
+        print(
+            "Codex runs hooks only after you have trusted them: open Codex here and run /hooks.\n"
+            "Project hooks also need the project itself to be trusted (Codex asks on first open)."
+        )
+    print(f"Restart {app} (or start a new session) for the hooks to load.")
     return 0
 
 
 def cmd_uninstall(args: argparse.Namespace) -> int:
-    from shuntkit.install import uninstall
+    from shuntkit.install import PROJECT_SCOPE, resolve_target, uninstall
 
-    removed = uninstall(Path(args.claude_dir).expanduser())
+    claude_dir, _ = resolve_target(args.scope, args.claude_dir, args.host)
+    removed = uninstall(claude_dir, args.host)
     if removed:
-        print("shuntkit removed:")
+        print(f"shuntkit removed ({_scope_label(args)}):")
         for r in removed:
             print(f"  {r}")
     else:
-        print("Nothing to remove.")
+        print(f"Nothing to remove in {claude_dir}.")
+        if args.scope == PROJECT_SCOPE and not args.claude_dir:
+            print(f"For a user-wide install, run: shuntkit uninstall --host {args.host} --user")
     return 0
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    from shuntkit.install import _is_ours  # noqa: PLC2701
+    from shuntkit.install import PROJECT_SCOPE, USER_SCOPE, hooks_registered, resolve_target
     from shuntkit.transports import get_transport
 
     config = Config.from_env()
@@ -149,17 +174,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except TransportError as exc:
         problems.append(str(exc))
 
-    settings = Path(args.claude_dir).expanduser() / "settings.json"
-    registered = False
-    if settings.is_file():
+    if args.claude_dir:
+        candidates = [resolve_target(PROJECT_SCOPE, args.claude_dir)[0]]
+    else:
+        candidates = [
+            resolve_target(scope, host=host)[0]
+            for host in ("claude", "codex")
+            for scope in (PROJECT_SCOPE, USER_SCOPE)
+        ]
+    registered: list[Path] = []
+    for claude_dir in candidates:
         try:
-            data = json.loads(settings.read_text(encoding="utf-8") or "{}")
-            registered = any(_is_ours(e) for e in data.get("hooks", {}).get("PreToolUse", []))
-        except json.JSONDecodeError:
-            problems.append(f"{settings} is not valid JSON.")
+            if hooks_registered(claude_dir):
+                registered.append(claude_dir / "settings.json")
+        except SystemExit as exc:
+            problems.append(str(exc))
     plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
     if registered:
-        print(f"  hooks:      registered in {settings}")
+        print("  hooks:      registered in " + ", ".join(str(r) for r in registered))
     elif plugin_root:
         print(f"  hooks:      running as plugin from {plugin_root}")
     else:
@@ -196,6 +228,27 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_scope_args(p: argparse.ArgumentParser) -> None:
+    scope = p.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--project",
+        dest="scope",
+        action="store_const",
+        const="project",
+        help="./.claude in the current directory; only this repository (default)",
+    )
+    scope.add_argument(
+        "--user",
+        dest="scope",
+        action="store_const",
+        const="user",
+        help="~/.claude; every project on this machine",
+    )
+    scope.add_argument("--claude-dir", help="An explicit settings directory (.claude or .codex)")
+    p.add_argument("--host", choices=list(HOSTS), default="claude", help="Coding agent (default: claude)")
+    p.set_defaults(scope="project", claude_dir=None)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="shuntkit",
@@ -208,6 +261,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("hook", help="PreToolUse hook (reads JSON from stdin)")
     p.add_argument("kind", choices=["read", "bash"])
+    p.add_argument("--host", choices=list(HOSTS), help="Override SHUNTKIT_HOST for this call")
     p.set_defaults(func=cmd_hook)
 
     p = sub.add_parser("read", help="Delegate a question over one or more files to the worker model")
@@ -226,17 +280,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", help="Override SHUNTKIT_MODEL for this call")
     p.set_defaults(func=cmd_write)
 
-    p = sub.add_parser("install", help="Register hooks, skills and the bulk-reader agent in ~/.claude")
-    p.add_argument("--claude-dir", default="~/.claude")
-    p.add_argument("--command", help="Override the shuntkit executable path written into hooks")
+    p = sub.add_parser(
+        "install",
+        help="Register hooks, skills and the bulk-reader agent (./.claude by default; ~/.claude with --user)",
+    )
+    _add_scope_args(p)
+    p.add_argument("--command", help="Override the shuntkit command written into hooks and skills")
     p.set_defaults(func=cmd_install)
 
     p = sub.add_parser("uninstall", help="Remove what 'install' added")
-    p.add_argument("--claude-dir", default="~/.claude")
+    _add_scope_args(p)
     p.set_defaults(func=cmd_uninstall)
 
     p = sub.add_parser("doctor", help="Check the environment")
-    p.add_argument("--claude-dir", default="~/.claude")
+    p.add_argument("--claude-dir", help="Only check this Claude settings directory for hooks")
     p.add_argument("--probe", action="store_true", help="Also make one tiny worker call")
     p.set_defaults(func=cmd_doctor)
 

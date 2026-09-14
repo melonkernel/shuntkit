@@ -1,13 +1,28 @@
 """Register shuntkit hooks, skills and the bulk-reader agent for a pip install.
 
-``shuntkit install`` adds two PreToolUse entries to ``~/.claude/settings.json``,
-writes the SKILL.md files to ``~/.claude/skills`` and the agent to
-``~/.claude/agents``. ``shuntkit uninstall`` removes exactly what it added.
-Both are idempotent.
+``shuntkit install`` adds two PreToolUse entries to a ``settings.json``, writes
+the SKILL.md files to ``skills/`` and the agent to ``agents/`` under one Claude
+settings directory. ``shuntkit uninstall`` removes exactly what it added. Both
+are idempotent.
 
-The hook command is written with the absolute path of the ``shuntkit``
-executable. Hooks run in a non-login shell, where ``~/.local/bin`` (uv, pipx)
-is often not on ``PATH``.
+Two hosts:
+
+- ``claude`` (default): Claude Code. Hooks go into ``settings.json``, skills
+  into ``skills/`` and the agent into ``agents/``.
+- ``codex``: Codex CLI. Only the Bash hook applies (Codex has no Read tool)
+  and it goes into ``hooks.json``. Codex runs hooks only after the user has
+  trusted them with ``/hooks``; project hooks also need a trusted project.
+  Codex plugins cannot ship hooks, so there is no plugin form for Codex.
+
+Two scopes:
+
+- ``project`` (default): ``./.claude`` in the current directory. Only that
+  repository gets the hooks. The files are meant to be committed, so the hook
+  command is the bare ``shuntkit`` name, which must be on ``PATH`` when Claude
+  Code starts.
+- ``user``: ``~/.claude``. Every project on the machine gets the hooks. The
+  hook command is the absolute path of the executable, because hooks run in a
+  non-login shell where ``~/.local/bin`` (uv, pipx) is often not on ``PATH``.
 """
 
 from __future__ import annotations
@@ -18,6 +33,7 @@ import shutil
 import sys
 from pathlib import Path
 
+from shuntkit.config import DEFAULT_HOST, HOSTS
 from shuntkit.skills import AGENTS, INSTALLED_COMMAND, SKILLS
 
 
@@ -34,6 +50,40 @@ def resolve_command() -> str:
     return str(Path(found).resolve()) if found else INSTALLED_COMMAND
 
 
+PROJECT_SCOPE = "project"
+USER_SCOPE = "user"
+
+
+def resolve_target(scope: str, claude_dir: str | None = None, host: str = DEFAULT_HOST) -> tuple[Path, str]:
+    """The settings directory and default hook command for a scope and host.
+
+    An explicit ``claude_dir`` wins over the scope and behaves like a user
+    install (absolute command path).
+    """
+    if host not in HOSTS:
+        raise ValueError(f"unknown host: {host!r}")
+    dirname = ".claude" if host == "claude" else ".codex"
+    if claude_dir:
+        return Path(claude_dir).expanduser(), resolve_command()
+    if scope == USER_SCOPE:
+        return Path.home() / dirname, resolve_command()
+    if scope == PROJECT_SCOPE:
+        return Path.cwd() / dirname, INSTALLED_COMMAND
+    raise ValueError(f"unknown install scope: {scope!r}")
+
+
+def hooks_registered(claude_dir: Path) -> bool:
+    """True if ``settings.json`` (Claude Code) or ``hooks.json`` (Codex) in the
+    directory carries shuntkit's PreToolUse hooks."""
+    for name in ("settings.json", "hooks.json"):
+        path = claude_dir / name
+        if path.is_file():
+            settings = _load_settings(path)
+            if any(_is_ours(e) for e in settings.get("hooks", {}).get("PreToolUse", [])):
+                return True
+    return False
+
+
 def hook_entries(command: str) -> list[dict]:
     cmd = command if " " not in command else f'"{command}"'
     return [
@@ -44,6 +94,16 @@ def hook_entries(command: str) -> list[dict]:
         {
             "matcher": "Bash",
             "hooks": [{"type": "command", "command": f"{cmd} hook bash", "timeout": 10}],
+        },
+    ]
+
+
+def codex_hook_entries(command: str) -> list[dict]:
+    cmd = command if " " not in command else f'"{command}"'
+    return [
+        {
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": f"{cmd} hook bash --host codex", "timeout": 10}],
         },
     ]
 
@@ -70,8 +130,10 @@ def _save_settings(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
-def install(claude_dir: Path, command: str | None = None) -> list[str]:
+def install(claude_dir: Path, command: str | None = None, host: str = DEFAULT_HOST) -> list[str]:
     command = command or resolve_command()
+    if host == "codex":
+        return _install_codex(claude_dir, command)
     settings_path = claude_dir / "settings.json"
     settings = _load_settings(settings_path)
     hooks = settings.setdefault("hooks", {})
@@ -95,7 +157,43 @@ def install(claude_dir: Path, command: str | None = None) -> list[str]:
     return written
 
 
-def uninstall(claude_dir: Path) -> list[str]:
+def _install_codex(codex_dir: Path, command: str) -> list[str]:
+    hooks_path = codex_dir / "hooks.json"
+    data = _load_settings(hooks_path)
+    hooks = data.setdefault("hooks", {})
+    pre = [e for e in hooks.get("PreToolUse", []) if not _is_ours(e)]
+    pre.extend(codex_hook_entries(command))
+    hooks["PreToolUse"] = pre
+    _save_settings(hooks_path, data)
+    return [str(hooks_path)]
+
+
+def _uninstall_codex(codex_dir: Path) -> list[str]:
+    hooks_path = codex_dir / "hooks.json"
+    if not hooks_path.is_file():
+        return []
+    data = _load_settings(hooks_path)
+    hooks = data.get("hooks", {})
+    before = hooks.get("PreToolUse", [])
+    after = [e for e in before if not _is_ours(e)]
+    if len(after) == len(before):
+        return []
+    if after:
+        hooks["PreToolUse"] = after
+    else:
+        hooks.pop("PreToolUse", None)
+    if not hooks:
+        data.pop("hooks", None)
+    if data:
+        _save_settings(hooks_path, data)
+    else:
+        hooks_path.unlink()  # an empty hooks.json has no reason to exist
+    return [f"{hooks_path} (hooks)"]
+
+
+def uninstall(claude_dir: Path, host: str = DEFAULT_HOST) -> list[str]:
+    if host == "codex":
+        return _uninstall_codex(claude_dir)
     removed: list[str] = []
     settings_path = claude_dir / "settings.json"
     if settings_path.is_file():

@@ -39,7 +39,7 @@ Two hooks fire before every tool call:
 | Hook | Blocks | Lets through |
 |------|--------|--------------|
 | `Read` | Whole-file reads over the threshold (default 350 lines); `offset`-only reads that would return more than the threshold | Small files; genuine slices with `limit`; images, PDFs, notebooks |
-| `Bash` | `cat`, `less`, `more`, `bat` on large files | Pipes, redirects, `head`/`tail` with a bounded count, `grep` |
+| `Bash` | `cat`, `nl`, `less`, `more`, `bat` on large files; `sed -n 'A,$p'` and `sed` without `-n`; a leading `cd dir &&` is followed | Pipes, redirects, `head`/`tail` with a bounded count, `sed -n 'A,Bp'` slices, `grep`/`rg` |
 
 Genuine slices of a large file are charged against a per-session **slice budget** (default 700 lines per file). Once spent, further slices are blocked until the file has been delegated once. This stops a blocked file from being reassembled piece by piece.
 
@@ -53,11 +53,31 @@ You need Claude Code installed and logged in, and Python 3.10 or newer on macOS 
 
 ```bash
 uv tool install shuntkit        # or: pipx install shuntkit / pip install shuntkit
-shuntkit install                # registers hooks, skills and the bulk-reader agent in ~/.claude
+cd your-project
+shuntkit install                # registers hooks, skills and the bulk-reader agent in ./.claude
 shuntkit doctor --probe         # one tiny Haiku call to confirm it works
 ```
 
 Restart Claude Code. Done.
+
+`shuntkit install` is **per project** by default: it writes to `./.claude` in the current directory and only that repository gets the hooks. Commit the files to share them with your team; each teammate needs `shuntkit` on their `PATH`. To turn it on for every project on your machine instead:
+
+```bash
+shuntkit install --user         # writes to ~/.claude with the absolute path of the executable
+```
+
+If you launch Claude Code from an app rather than a terminal and `shuntkit` is not on that `PATH`, pass `--command "$(command -v shuntkit)"` to a project install.
+
+### Codex CLI
+
+```bash
+cd your-project
+shuntkit install --host codex   # writes the Bash hook into ./.codex/hooks.json (or ~/.codex with --user)
+```
+
+Then open Codex in that directory and run `/hooks` to review and trust the hook; Codex does not run untrusted hooks. Project hooks also need the project itself to be trusted, which Codex asks about on first open.
+
+Codex has no Read tool, so only the Bash hook applies, and it recognises the shell forms Codex uses to read files (`sed -n`, `cat -n`, `nl`). Blocked reads point at the `shuntkit read` command directly; there are no skills or subagent on this host. Delegation still runs through the Claude CLI or the Anthropic API, so one of those must be set up. Codex plugins cannot ship hooks, so there is no plugin form for Codex.
 
 ### Option B: Claude Code plugin
 
@@ -73,7 +93,9 @@ The plugin form needs only `python3` on your `PATH`; nothing is pip-installed.
 ### Uninstall
 
 ```bash
-shuntkit uninstall              # removes exactly what 'install' added
+shuntkit uninstall              # removes exactly what 'install' added to ./.claude
+shuntkit uninstall --user       # same for ~/.claude
+shuntkit uninstall --host codex # same for ./.codex (add --user for ~/.codex)
 ```
 
 ## Usage
@@ -125,7 +147,8 @@ Everything is an environment variable. Set them in your shell, or under `"env"` 
 | `SHUNTKIT_SANCTION_TTL_SECONDS` | `14400` | After a file is delegated, its slices are unrestricted for this long. |
 | `SHUNTKIT_MODEL` | `haiku` | Worker model. Any alias or id the Claude CLI accepts (`haiku`, `sonnet`, `claude-haiku-4-5`, ...). |
 | `SHUNTKIT_TRANSPORT` | `claude` | `claude` (Claude Code CLI, uses your login) or `anthropic` (Anthropic API via the official SDK). |
-| `SHUNTKIT_DELEGATE` | `cli` | What blocked reads are redirected to: `cli` (the `shuntkit read` command) or `subagent` (the `bulk-reader` Haiku subagent). |
+| `SHUNTKIT_DELEGATE` | `cli` | What blocked reads are redirected to: `cli` (the `shuntkit read` command) or `subagent` (the `bulk-reader` Haiku subagent). Ignored on Codex. |
+| `SHUNTKIT_HOST` | `claude` | `claude` or `codex`. Changes the wording of block messages. `shuntkit install --host codex` writes hooks that pass `--host codex` explicitly, so you rarely need this. |
 | `SHUNTKIT_SECRET_GUARD` | `on` | Refuse to delegate files that look like secrets. |
 | `SHUNTKIT_CITATIONS` | `on` | Attach `(file:line)` to quotes found exactly once in the delegated files. |
 | `SHUNTKIT_TIMEOUT_SECONDS` | `180` | Ceiling for one worker call. |
@@ -189,9 +212,8 @@ See [docs/design.md](docs/design.md) for how each mechanism works and where it s
 
 ## Roadmap
 
-- **Codex CLI as a host.** Codex's hook system mirrors Claude Code's (same `PreToolUse` event, same deny JSON), but Codex reads files through the shell rather than a Read tool, so the Bash hook needs to recognise `sed -n`, `nl` and `rg` context reads, and a `codex exec` worker transport is needed for users without the Claude CLI. Tracked in [#5](https://github.com/melonkernel/shuntkit/issues/5).
-- **Shell forms beyond `cat`/`head`/`tail`.** `sed -n 'A,Bp'` ranges charged to the slice budget; heredoc and `xargs` reads recognised.
-- **Codex CLI as a worker.** A `codex` transport for teams whose cheap model lives on the OpenAI side.
+- **Codex CLI as a worker.** A `codex exec` transport for Codex users without the Claude CLI, and for teams whose cheap model lives on the OpenAI side. Tracked in [#5](https://github.com/melonkernel/shuntkit/issues/5).
+- **Shell forms beyond the current set.** `awk 'NR>=A && NR<=B'`, heredoc and `xargs` reads recognised.
 
 Ideas and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
