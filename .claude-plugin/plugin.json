@@ -1,0 +1,23 @@
+{
+  "name": "shuntkit",
+  "displayName": "shuntkit",
+  "version": "0.1.0",
+  "description": "Route bulk file reads and boilerplate generation to a cheaper Claude model. Hooks block large file reads and redirect to bulk-reader/code-writer skills backed by the Claude CLI or the Anthropic API. Vendor-free port of Spotify's shunt plugin.",
+  "author": {
+    "name": "melonkernel",
+    "url": "https://github.com/melonkernel"
+  },
+  "homepage": "https://github.com/melonkernel/shuntkit",
+  "repository": "https://github.com/melonkernel/shuntkit",
+  "license": "Apache-2.0",
+  "keywords": [
+    "token-optimization",
+    "model-routing",
+    "delegation",
+    "context-engineering",
+    "haiku",
+    "shunt"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "skills": "./skills/"
+}

@@ -1,0 +1,95 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shuntkit"
+dynamic = ["version"]
+description = "Route bulk file reads and boilerplate generation from Claude Code to a cheaper Claude model. Vendor-free port of Spotify's shunt plugin."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.10"
+authors = [{ name = "melonkernel" }]
+keywords = [
+  "claude-code",
+  "claude",
+  "anthropic",
+  "hooks",
+  "token-optimization",
+  "model-routing",
+  "context-engineering",
+  "shunt",
+  "spotify-portal",
+  "haiku",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Build Tools",
+  "Topic :: Utilities",
+]
+dependencies = []
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.50"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+  "mypy>=1.10",
+]
+
+[project.scripts]
+shuntkit = "shuntkit.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/melonkernel/shuntkit"
+Repository = "https://github.com/melonkernel/shuntkit"
+Issues = "https://github.com/melonkernel/shuntkit/issues"
+Changelog = "https://github.com/melonkernel/shuntkit/blob/main/CHANGELOG.md"
+Upstream = "https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt"
+
+[tool.hatch.version]
+path = "src/shuntkit/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["src/shuntkit", "tests", "README.md", "LICENSE", "NOTICE", "CHANGELOG.md"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shuntkit"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "PL"]
+ignore = ["PLR0913", "PLR2004", "PLR0912", "PLR0915", "PLR0911", "PLR0917", "PLC0415"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["PLR2004", "S101", "B905"]
+# SKILL.md frontmatter descriptions must stay on one line.
+"src/shuntkit/skills.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true
+files = ["src/shuntkit"]

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "shuntkit",
+  "version": "0.1.0",
+  "description": "shuntkit plugin marketplace.",
+  "owner": {
+    "name": "melonkernel",
+    "url": "https://github.com/melonkernel"
+  },
+  "plugins": [
+    {
+      "name": "shuntkit",
+      "description": "Route bulk file reads and boilerplate generation to a cheaper Claude model. Vendor-free port of Spotify's shunt plugin.",
+      "version": "0.1.0",
+      "author": {
+        "name": "melonkernel"
+      },
+      "homepage": "https://github.com/melonkernel/shuntkit",
+      "repository": "https://github.com/melonkernel/shuntkit",
+      "source": "./",
+      "category": "developer-tools"
+    }
+  ]
+}

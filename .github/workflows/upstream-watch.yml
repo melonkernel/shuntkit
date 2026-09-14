@@ -1,0 +1,60 @@
+name: Upstream watch
+
+# Weekly check of spotify/portal-ai-plugins plugins/shunt against the commit
+# recorded in upstream/UPSTREAM.lock. Opens or updates one issue when there
+# are unreviewed changes. See docs/upstream.md.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Diff upstream
+        id: diff
+        run: |
+          set -euo pipefail
+          if scripts/sync-upstream.sh --check > summary.txt 2>&1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            cat summary.txt
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            cat summary.txt
+            {
+              echo '```'
+              cat summary.txt
+              echo '```'
+              echo
+              echo 'Commits:'
+              echo '```'
+              git log --oneline "$(head -n1 upstream/UPSTREAM.lock)"..upstream/main -- plugins/shunt
+              echo '```'
+              echo
+              echo 'Review per [docs/upstream.md](docs/upstream.md), then run `scripts/sync-upstream.sh --update`.'
+            } > body.md
+          fi
+
+      - name: Open or update issue
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="Upstream shunt changed"
+          existing="$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file body.md
+          else
+            gh issue create --title "$title" --label upstream --body-file body.md
+          fi

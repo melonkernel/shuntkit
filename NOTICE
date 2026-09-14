@@ -1,0 +1,15 @@
+shuntkit
+Copyright 2026 melonkernel
+
+This product is a derivative work of the "shunt" plugin from
+spotify/portal-ai-plugins (https://github.com/spotify/portal-ai-plugins),
+Copyright Spotify AB, licensed under the Apache License, Version 2.0.
+
+The hook design (block whole-file reads over a line threshold and redirect
+to a bulk-reader skill), the bulk-reader and code-writer skill concepts, the
+prompt shapes, and the hook evaluation cases originate from that project.
+The transport layer was rewritten to use the Claude Code CLI or the
+Anthropic API in place of the Spotify Portal / AiKA backend.
+
+The engineering write-up that motivated the original plugin:
+https://engineering.atspotify.com/2026/9/portal-by-spotify-cut-my-claude-code-token-usage-by-90

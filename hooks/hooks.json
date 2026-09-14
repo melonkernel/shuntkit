@@ -1,0 +1,27 @@
+{
+  "description": "shuntkit: block whole-file reads over the line threshold and redirect them to the bulk-reader skill",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}/src\" python3 -m shuntkit hook read",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}/src\" python3 -m shuntkit hook bash",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

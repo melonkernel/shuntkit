@@ -1,0 +1,29 @@
+name: Bug report
+description: Something did not work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Include the exact command and the hook message or error text.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `shuntkit doctor`
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: claude
+    attributes:
+      label: Claude Code version (`claude --version`)
+  - type: dropdown
+    id: install
+    attributes:
+      label: How is shuntkit installed?
+      options:
+        - pip / uv / pipx
+        - Claude Code plugin
